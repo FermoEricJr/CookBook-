@@ -1,0 +1,203 @@
+package com.example.cookapp
+
+import android.app.Activity
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.provider.MediaStore
+import android.widget.Toast
+import androidx.activity.enableEdgeToEdge
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.GravityCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import com.example.cookapp.databinding.ActivityUploadrecipeBinding
+import okhttp3.*
+import java.io.File
+import java.io.IOException
+
+class Uploadrecipe : AppCompatActivity() {
+
+    private lateinit var bind: ActivityUploadrecipeBinding
+    private val client = OkHttpClient()
+
+    private var imageUri: Uri? = null
+    private val IMAGE_PICK_CODE = 200
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+
+        bind = ActivityUploadrecipeBinding.inflate(layoutInflater)
+        setContentView(bind.root)
+
+        ViewCompat.setOnApplyWindowInsetsListener(bind.main) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            insets
+        }
+         // Apply edge-to-edge padding
+        ViewCompat.setOnApplyWindowInsetsListener(bind.main) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            insets
+        }
+
+        // ================================
+        // 🔹 Drawer & Top Bar
+        // ================================
+        bind.topAppBar.setNavigationOnClickListener {
+            bind.drawerLayout.openDrawer(GravityCompat.START)
+        }
+
+        bind.navigationDrawer.setNavigationItemSelectedListener { menuItem ->
+            when (menuItem.itemId) {
+                R.id.nav_home -> {
+                    startActivity(Intent(this, userpage::class.java))
+                    finish()
+                }
+                R.id.nav_profile -> startActivity(Intent(this, Profile::class.java))
+                R.id.nav_about -> startActivity(Intent(this, AboutUs::class.java))
+                R.id.nav_signout -> {
+                    val i = Intent(this, MainActivity::class.java)
+                    i.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                    startActivity(i)
+                    finish()
+                }
+            }
+            bind.drawerLayout.closeDrawer(GravityCompat.START)
+            true
+        }
+
+        // ================================
+        // 🔹 Bottom Navigation
+        // ================================
+        bind.bottomNavigationView.selectedItemId = R.id.nav_cookbook
+
+        bind.bottomNavigationView.setOnItemSelectedListener { item ->
+            when (item.itemId) {
+                R.id.nav_home -> {
+                    startActivity(Intent(this, userpage::class.java)); finish(); true
+                }
+                R.id.nav_my_recipes -> {
+                    startActivity(Intent(this, MyRecipes::class.java)); finish(); true
+                }
+                R.id.nav_cookbook -> true
+                R.id.nav_notifications -> {
+                    startActivity(Intent(this, Notifications::class.java)); finish(); true
+                }
+                else -> false
+            }
+        }
+
+        // Drawer
+        bind.topAppBar.setNavigationOnClickListener {
+            bind.drawerLayout.openDrawer(GravityCompat.START)
+        }
+
+        // 📌 PICK IMAGE
+        bind.ivRecipeImage.setOnClickListener {
+            pickImage()
+        }
+
+        // 📌 BTN UPLOAD
+        bind.btnUpload.setOnClickListener {
+            val title = bind.etRecipeName.text.toString().trim()
+            val ingredients = bind.etIngredients.text.toString().trim()
+
+            if (title.isEmpty()) {
+                Toast.makeText(this, "Please enter a recipe name", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (imageUri == null) {
+                Toast.makeText(this, "Please select a recipe image", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            val shared = getSharedPreferences("user", MODE_PRIVATE)
+            val userId = shared.getInt("user_id", -1)
+
+            if (userId == -1) {
+                Toast.makeText(this, "User not logged in", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            uploadRecipe(userId, title, ingredients, imageUri!!)
+        }
+    }
+
+    // ====================================
+    // 📌 Select Image From Gallery
+    // ====================================
+    private fun pickImage() {
+        val intent = Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+        startActivityForResult(intent, IMAGE_PICK_CODE)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+
+        if (resultCode == Activity.RESULT_OK && requestCode == IMAGE_PICK_CODE) {
+            imageUri = data?.data
+            bind.ivRecipeImage.setImageURI(imageUri)
+        }
+    }
+
+    // ====================================
+    // 📌 Multipart Upload (WITH IMAGE)
+    // ====================================
+    private fun uploadRecipe(userId: Int, title: String, ingredients: String, uri: Uri) {
+        val filePath = getRealPathFromURI(uri)
+        if (filePath == null) {
+            Toast.makeText(this, "Image error", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val file = File(filePath)
+        val imageRequestBody = file.asRequestBody("image/*".toMediaType())
+        val imagePart = MultipartBody.Part.createFormData("image", file.name, imageRequestBody)
+
+        val formBody = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("user_id", userId.toString())
+            .addFormDataPart("recipe_name", title)
+            .addFormDataPart("ingredients", ingredients)
+            .addPart(imagePart)
+            .build()
+
+        val request = Request.Builder()
+            .url("http://192.168.1.3/cookbook_api/upload_recipe.php")
+            .post(formBody)
+            .build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                runOnUiThread {
+                    Toast.makeText(this@Uploadrecipe, "Connection Error", Toast.LENGTH_SHORT).show()
+                }
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                val result = response.body?.string()
+                runOnUiThread {
+                    if (result?.contains("\"success\":true") == true) {
+                        Toast.makeText(this@Uploadrecipe, "Recipe Uploaded!", Toast.LENGTH_SHORT).show()
+                        finish()
+                    } else {
+                        Toast.makeText(this@Uploadrecipe, "Upload Failed!", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        })
+    }
+
+    private fun getRealPathFromURI(uri: Uri): String? {
+        val projection = arrayOf(MediaStore.Images.Media.DATA)
+        val cursor = contentResolver.query(uri, projection, null, null, null)
+        cursor?.moveToFirst()
+        val index = cursor?.getColumnIndex(projection[0])
+        val path = index?.let { cursor.getString(it) }
+        cursor?.close()
+        return path
+    }
+}

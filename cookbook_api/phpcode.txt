@@ -1,0 +1,425 @@
+//db
+<?php
+// db.php
+header("Content-Type: application/json");
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Headers: Content-Type, Authorization");
+$host = '127.0.0.1';
+$db   = 'cookbook_db';
+$user = 'root';
+$pass = ''; // change if you set a password
+$charset = 'utf8mb4';
+
+$dsn = "mysql:host=$host;dbname=$db;charset=$charset";
+$options = [
+    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+];
+try {
+    $pdo = new PDO($dsn, $user, $pass, $options);
+} catch (PDOException $e) {
+    http_response_code(500);
+    echo json_encode(['error' => 'DB Connection failed: '.$e->getMessage()]);
+    exit;
+}
+?>
+
+//helpers.php
+<?php
+// helpers.php
+require_once 'db.php';
+
+function json_input() {
+    return json_decode(file_get_contents('php://input'), true);
+}
+
+function respond($data) {
+    echo json_encode($data);
+    exit;
+}
+
+/**
+ * Simple auth: expects Authorization: Bearer <token>
+ * For this starter token == user_id returned on login/register.
+ * In production, replace with JWT.
+ */
+function get_bearer_token() {
+    $headers = null;
+    if (isset($_SERVER['HTTP_AUTHORIZATION'])) {
+        $headers = trim($_SERVER["HTTP_AUTHORIZATION"]);
+    } else if (function_exists('apache_request_headers')) {
+        $requestHeaders = apache_request_headers();
+        if (isset($requestHeaders['Authorization'])) {
+            $headers = trim($requestHeaders['Authorization']);
+        }
+    }
+    if (!$headers) return null;
+    if (preg_match('/Bearer\s(\S+)/', $headers, $matches)) {
+        return $matches[1];
+    }
+    return null;
+}
+
+function auth_user($pdo) {
+    $token = get_bearer_token();
+    if (!$token) return null;
+    // token is user_id in this starter
+    $stmt = $pdo->prepare("SELECT id, username, email, profile_image FROM users WHERE id = ?");
+    $stmt->execute([$token]);
+    $user = $stmt->fetch();
+    return $user ?: null;
+}
+
+/** Safe file name builder */
+function unique_filename($original) {
+    $ext = pathinfo($original, PATHINFO_EXTENSION);
+    $safe = preg_replace("/[^a-zA-Z0-9-_\.]/","_", pathinfo($original, PATHINFO_FILENAME));
+    return time() . "_" . $safe . ($ext ? ".".$ext : "");
+}
+?>
+
+
+
+//signup.php
+<?php
+include "config.php";
+
+if ($_SERVER['REQUEST_METHOD'] == 'POST') {
+
+    $firstname = $_POST['firstname'];
+    $lastname = $_POST['lastname'];
+    $email = $_POST['email'];
+    $password = password_hash($_POST['password'], PASSWORD_DEFAULT);
+
+    // Check if email already exists
+    $check = $conn->prepare("SELECT id FROM users WHERE email = ?");
+    $check->bind_param("s", $email);
+    $check->execute();
+    $check->store_result();
+
+    if ($check->num_rows > 0) {
+        echo json_encode([
+            "success" => false,
+            "message" => "Email already registered"
+        ]);
+        exit;
+    }
+
+    // Insert new user
+    $stmt = $conn->prepare("
+        INSERT INTO users (firstname, lastname, email, password)
+        VALUES (?, ?, ?, ?)
+    ");
+    $stmt->bind_param("ssss", $firstname, $lastname, $email, $password);
+
+    if ($stmt->execute()) {
+        echo json_encode([
+            "success" => true,
+            "message" => "Account created successfully"
+        ]);
+    } else {
+        echo json_encode([
+            "success" => false,
+            "message" => "Error creating account"
+        ]);
+    }
+
+    $stmt->close();
+}
+
+$conn->close();
+?>
+
+
+//login.php
+<?php
+include "config.php";
+
+if ($_SERVER['REQUEST_METHOD'] == 'POST') {
+
+    $email = $_POST['email'];
+    $password = $_POST['password'];
+
+    $stmt = $conn->prepare("
+        SELECT id, firstname, lastname, password, profile_image 
+        FROM users 
+        WHERE email = ?
+    ");
+    $stmt->bind_param("s", $email);
+    $stmt->execute();
+    $stmt->store_result();
+    $stmt->bind_result($id, $firstname, $lastname, $hash, $profile_image);
+
+    if ($stmt->num_rows > 0) {
+        $stmt->fetch();
+
+        if (password_verify($password, $hash)) {
+
+            echo json_encode([
+                "success" => true,
+                "user" => [
+                    "id" => $id,
+                    "firstname" => $firstname,
+                    "lastname" => $lastname,
+                    "email" => $email,
+                    "profile_image" => $profile_image
+                ]
+            ]);
+
+        } else {
+            echo json_encode([
+                "success" => false,
+                "message" => "Incorrect password"
+            ]);
+        }
+
+    } else {
+        echo json_encode([
+            "success" => false,
+            "message" => "Email not found"
+        ]);
+    }
+
+    $stmt->close();
+}
+
+$conn->close();
+?>
+
+//config.php
+<?php
+$host = "localhost";
+$user = "root";
+$pass = "";
+$db = "cookbook_db";
+
+$conn = new mysqli($host, $user, $pass, $db);
+
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+?>
+
+//create_recipe.php
+<?php
+// create_recipe.php
+require 'db.php';
+require 'helpers.php';
+
+$user = auth_user($pdo);
+if (!$user) { http_response_code(401); echo json_encode(['error'=>'Unauthorized']); exit; }
+
+// Expect multipart/form-data: title, description, ingredients, steps, category, image (optional)
+$title = $_POST['title'] ?? '';
+$description = $_POST['description'] ?? '';
+$ingredients = $_POST['ingredients'] ?? '';
+$steps = $_POST['steps'] ?? '';
+$category = $_POST['category'] ?? null;
+
+if (!$title) { http_response_code(400); echo json_encode(['error'=>'Missing title']); exit; }
+
+$image_path = null;
+if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
+    $uploads_dir = __DIR__.'/uploads';
+    if (!is_dir($uploads_dir)) mkdir($uploads_dir, 0755, true);
+    $tmp = $_FILES['image']['tmp_name'];
+    $name = unique_filename($_FILES['image']['name']);
+    $dest = $uploads_dir . '/' . $name;
+    if (move_uploaded_file($tmp, $dest)) {
+        $image_path = 'uploads/'.$name;
+    }
+}
+
+try {
+    $stmt = $pdo->prepare("INSERT INTO recipes (user_id, title, description, ingredients, steps, category, image_path) VALUES (?, ?, ?, ?, ?, ?, ?)");
+    $stmt->execute([$user['id'], $title, $description, $ingredients, $steps, $category, $image_path]);
+    $id = (int)$pdo->lastInsertId();
+    echo json_encode(['success'=>true, 'id'=>$id, 'image_path'=>$image_path]);
+} catch (Exception $e) {
+    http_response_code(500); echo json_encode(['error'=>$e->getMessage()]);
+}
+?>
+
+//GETRECIPE
+<?php
+// get_recipes.php
+require 'db.php';
+
+$sql = "SELECT r.id, r.title, r.description, r.ingredients, r.steps, r.category, r.image_path, r.created_at,
+            u.id as user_id, u.username, u.profile_image,
+            IFNULL(ROUND( (SELECT AVG(stars) FROM ratings WHERE recipe_id = r.id),2), 0) as avg_rating,
+            (SELECT COUNT(*) FROM ratings WHERE recipe_id = r.id) as rating_count
+        FROM recipes r
+        JOIN users u ON r.user_id = u.id
+        ORDER BY r.created_at DESC";
+$stmt = $pdo->query($sql);
+$rows = $stmt->fetchAll();
+echo json_encode($rows);
+?>
+
+//OTHER THING TO HA 
+//GETRECIPE NOT TO DUPLICATE
+<?php
+// get_recipe.php
+require 'db.php';
+
+$id = $_GET['id'] ?? null;
+if (!$id) { http_response_code(400); echo json_encode(['error'=>'Missing id']); exit; }
+
+$stmt = $pdo->prepare("SELECT r.*, u.username, u.profile_image FROM recipes r JOIN users u ON r.user_id=u.id WHERE r.id = ?");
+$stmt->execute([$id]);
+$recipe = $stmt->fetch();
+if (!$recipe) { http_response_code(404); echo json_encode(['error'=>'Not found']); exit; }
+
+$ratingStmt = $pdo->prepare("SELECT IFNULL(ROUND(AVG(stars),2),0) as avg, COUNT(*) as count FROM ratings WHERE recipe_id = ?");
+$ratingStmt->execute([$id]); $rating = $ratingStmt->fetch();
+
+$recipe['avg_rating'] = $rating['avg'];
+$recipe['rating_count'] = $rating['count'];
+
+echo json_encode($recipe);
+?>
+
+//UPDATE recipe
+<?php
+// update_recipe.php
+require 'db.php';
+require 'helpers.php';
+
+$user = auth_user($pdo);
+if (!$user) { http_response_code(401); echo json_encode(['error'=>'Unauthorized']); exit; }
+
+// Allow multipart (image) or JSON
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_FILES)) {
+    $id = $_POST['id'] ?? null;
+    $title = $_POST['title'] ?? null;
+    $description = $_POST['description'] ?? null;
+    $ingredients = $_POST['ingredients'] ?? null;
+    $steps = $_POST['steps'] ?? null;
+    $category = $_POST['category'] ?? null;
+
+    if (!$id) { http_response_code(400); echo json_encode(['error'=>'Missing id']); exit; }
+
+    // confirm owner
+    $check = $pdo->prepare("SELECT user_id, image_path FROM recipes WHERE id = ?");
+    $check->execute([$id]); $r = $check->fetch();
+    if (!$r) { http_response_code(404); echo json_encode(['error'=>'Not found']); exit; }
+    if ($r['user_id'] != $user['id']) { http_response_code(403); echo json_encode(['error'=>'Forbidden']); exit; }
+
+    $image_path = $r['image_path'];
+    if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
+        $uploads_dir = __DIR__.'/uploads';
+        if (!is_dir($uploads_dir)) mkdir($uploads_dir, 0755, true);
+        $tmp = $_FILES['image']['tmp_name'];
+        $name = unique_filename($_FILES['image']['name']);
+        $dest = $uploads_dir . '/' . $name;
+        if (move_uploaded_file($tmp, $dest)) {
+            $image_path = 'uploads/'.$name;
+        }
+    }
+
+    try {
+        $stmt = $pdo->prepare("UPDATE recipes SET title = ?, description = ?, ingredients = ?, steps = ?, category = ?, image_path = ? WHERE id = ?");
+        $stmt->execute([$title, $description, $ingredients, $steps, $category, $image_path, $id]);
+        echo json_encode(['success'=>true]);
+    } catch (Exception $e) { http_response_code(500); echo json_encode(['error'=>$e->getMessage()]); }
+} else {
+    // JSON update
+    $data = json_input();
+    $id = $data['id'] ?? null;
+    if (!$id) { http_response_code(400); echo json_encode(['error'=>'Missing id']); exit; }
+    // owner check
+    $check = $pdo->prepare("SELECT user_id FROM recipes WHERE id = ?");
+    $check->execute([$id]); $r = $check->fetch();
+    if (!$r) { http_response_code(404); echo json_encode(['error'=>'Not found']); exit; }
+    if ($r['user_id'] != $user['id']) { http_response_code(403); echo json_encode(['error'=>'Forbidden']); exit; }
+
+    $title = $data['title'] ?? null;
+    $description = $data['description'] ?? null;
+    $ingredients = $data['ingredients'] ?? null;
+    $steps = $data['steps'] ?? null;
+    $category = $data['category'] ?? null;
+
+    try {
+        $stmt = $pdo->prepare("UPDATE recipes SET title = ?, description = ?, ingredients = ?, steps = ?, category = ? WHERE id = ?");
+        $stmt->execute([$title, $description, $ingredients, $steps, $category, $id]);
+        echo json_encode(['success'=>true]);
+    } catch (Exception $e) { http_response_code(500); echo json_encode(['error'=>$e->getMessage()]); }
+}
+?>
+
+//DELETE recipe
+<?php
+// delete_recipe.php
+require 'db.php';
+require 'helpers.php';
+
+$user = auth_user($pdo);
+if (!$user) { http_response_code(401); echo json_encode(['error'=>'Unauthorized']); exit; }
+
+$data = json_decode(file_get_contents('php://input'), true);
+$id = $data['id'] ?? null;
+if (!$id) { http_response_code(400); echo json_encode(['error'=>'Missing id']); exit; }
+
+// confirm owner
+$check = $pdo->prepare("SELECT user_id, image_path FROM recipes WHERE id = ?");
+$check->execute([$id]); $r = $check->fetch();
+if (!$r) { http_response_code(404); echo json_encode(['error'=>'Not found']); exit; }
+if ($r['user_id'] != $user['id']) { http_response_code(403); echo json_encode(['error'=>'Forbidden']); exit; }
+
+try {
+    $stmt = $pdo->prepare("DELETE FROM recipes WHERE id = ?");
+    $stmt->execute([$id]);
+    // optionally delete image file from uploads folder
+    if (!empty($r['image_path'])) {
+        $file = __DIR__ . '/' . $r['image_path'];
+        if (file_exists($file)) @unlink($file);
+    }
+    echo json_encode(['success'=>true]);
+} catch (Exception $e) { http_response_code(500); echo json_encode(['error'=>$e->getMessage()]); }
+?>
+
+//RATE recipe
+<?php
+// rate_recipe.php
+require 'db.php';
+require 'helpers.php';
+
+$user = auth_user($pdo);
+if (!$user) { http_response_code(401); echo json_encode(['error'=>'Unauthorized']); exit; }
+
+$data = json_decode(file_get_contents('php://input'), true);
+$recipe_id = $data['recipe_id'] ?? null;
+$stars = (int)($data['stars'] ?? 0);
+
+if (!$recipe_id || $stars < 1 || $stars > 5) { http_response_code(400); echo json_encode(['error'=>'Bad request']); exit; }
+
+try {
+    $stmt = $pdo->prepare("INSERT INTO ratings (user_id, recipe_id, stars) VALUES (?, ?, ?)
+        ON DUPLICATE KEY UPDATE stars = VALUES(stars), created_at = CURRENT_TIMESTAMP");
+    $stmt->execute([$user['id'], $recipe_id, $stars]);
+
+    $r = $pdo->prepare("SELECT IFNULL(ROUND(AVG(stars),2),0) as avg, COUNT(*) as count FROM ratings WHERE recipe_id = ?");
+    $r->execute([$recipe_id]); $rating = $r->fetch();
+    echo json_encode(['success'=>true, 'avg'=>$rating['avg'], 'count'=>$rating['count']]);
+} catch (Exception $e) { http_response_code(500); echo json_encode(['error'=>$e->getMessage()]); }
+?>
+
+
+//GET USER RECIPE 
+<?php
+// get_user_recipes.php
+require 'db.php';
+
+$user_id = $_GET['user_id'] ?? null;
+if (!$user_id) { http_response_code(400); echo json_encode(['error'=>'Missing user_id']); exit; }
+
+$stmt = $pdo->prepare("SELECT r.*, u.username, u.profile_image,
+    IFNULL(ROUND( (SELECT AVG(stars) FROM ratings WHERE recipe_id = r.id),2), 0) as avg_rating,
+    (SELECT COUNT(*) FROM ratings WHERE recipe_id = r.id) as rating_count
+    FROM recipes r JOIN users u ON r.user_id = u.id
+    WHERE r.user_id = ? ORDER BY r.created_at DESC");
+$stmt->execute([$user_id]);
+$rows = $stmt->fetchAll();
+echo json_encode($rows);
+?>
